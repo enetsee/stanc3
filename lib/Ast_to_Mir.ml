@@ -183,11 +183,6 @@ let constrainaction_fname = function
   | Constrain -> fn_constrain
   | Unconstrain -> fn_unconstrain
 
-let internal_read_fn dread args =
-  match dread with
-  | ReadData -> FunApp (fn_read_data, args)
-  | ReadParam -> FunApp (fn_read_param, args)
-
 type decl_context =
   { dread: readaction option
   ; dconstrain: constrainaction option
@@ -231,8 +226,24 @@ let constraint_to_string t (c : constrainaction) =
     match c with Check -> "" | Constrain | Unconstrain -> "offset_multiplier" )
   | Identity -> ""
 
+let constraint_forl = function
+  | Ast.Identity | Offset _ | Ast.Multiplier _ | Ast.OffsetMultiplier _
+   |Lower _ | Upper _ | LowerUpper _ ->
+      for_scalar
+  | Ordered | PositiveOrdered | Simplex | UnitVector | CholeskyCorr
+   |CholeskyCov | Correlation | Covariance ->
+      for_eigen
+
+let extract_constraint_args = function
+  | Ast.Lower a | Upper a | Offset a | Multiplier a -> [a]
+  | LowerUpper (a1, a2) | OffsetMultiplier (a1, a2) -> [a1; a2]
+  | Ordered | PositiveOrdered | Simplex | UnitVector | CholeskyCorr
+   |CholeskyCov | Correlation | Covariance | Identity ->
+      []
+
 let rec gen_check decl_type decl_id decl_trans sloc adlevel =
-  let chk forl fn args =
+  let forl = constraint_forl decl_trans in
+  let chk fn args =
     let texpr_type = Ast.remove_size decl_type in
     forl
       (fun id ->
@@ -241,23 +252,14 @@ let rec gen_check decl_type decl_id decl_trans sloc adlevel =
       sloc
   in
   let constraint_str = mkstring sloc (constraint_to_string decl_trans Check) in
+  let args = extract_constraint_args decl_trans in
   match decl_trans with
   | Ast.Identity | Offset _ | Ast.Multiplier _ | Ast.OffsetMultiplier (_, _) ->
       []
-  | Lower b | Upper b -> [chk for_scalar constraint_str [b]]
   | LowerUpper (lb, ub) ->
       gen_check decl_type decl_id (Ast.Lower lb) sloc adlevel
       @ gen_check decl_type decl_id (Ast.Upper ub) sloc adlevel
-  | Ordered | PositiveOrdered | Simplex | UnitVector | CholeskyCorr
-   |CholeskyCov | Correlation | Covariance ->
-      [chk for_eigen constraint_str []]
-
-let extract_constraint_args = function
-  | Ast.Lower a | Upper a | Offset a | Multiplier a -> [a]
-  | LowerUpper (a1, a2) | OffsetMultiplier (a1, a2) -> [a1; a2]
-  | Ordered | PositiveOrdered | Simplex | UnitVector | CholeskyCorr
-   |CholeskyCov | Correlation | Covariance | Identity ->
-      []
+  | _ -> [chk constraint_str args]
 
 (* use nested funapp for each call to read_data with just the name and size? *)
 let gen_constraint dconstrain t arg =
@@ -276,25 +278,30 @@ let gen_constraint dconstrain t arg =
 
 let rec base_type = function
   | Ast.SArray (t, _) -> base_type t
+  | SVector _ | SRowVector _ | SMatrix _ -> Ast.UReal
   | x -> Ast.remove_size x
 
-let rec base_dims = function
-  | Ast.SVector d | SRowVector d -> [d]
-  | Ast.SMatrix (d1, d2) -> [d1; d2]
-  | Ast.SArray (t, _) -> base_dims t
-  | SInt | SReal -> []
-
-let mkread id var dread dconstrain sizedtype transform sloc =
+let mkparamread id var dconstrain sizedtype transform sloc =
   let read_base var =
     { var with
-      texpr=
-        internal_read_fn dread
-        @@ (mkstring var.texpr_loc id :: base_dims sizedtype)
+      texpr= FunApp (fn_read_param, [mkstring var.texpr_loc id])
     ; texpr_type= base_type sizedtype }
   in
-  let constrain var = gen_constraint dconstrain transform (read_base var) in
-  let read_assign var = {stmt= Assignment (var, constrain var); sloc} in
-  for_eigen read_assign var sloc
+  let constrain var =
+    { stmt=
+        Assignment (var, gen_constraint dconstrain transform (read_base var))
+    ; sloc }
+  in
+  for_eigen constrain var sloc
+
+let mkdataread id var sizedtype sloc =
+  let read_base var =
+    { var with
+      texpr= FunApp (fn_read_data, [mkstring var.texpr_loc id])
+    ; texpr_type= base_type sizedtype }
+  in
+  let read_assign var = {stmt= Assignment (var, read_base var); sloc} in
+  for_scalar read_assign var sloc
 
 let trans_decl {dread; dconstrain; dadlevel} sloc sizedtype transform
     identifier initial_value =
@@ -302,7 +309,7 @@ let trans_decl {dread; dconstrain; dadlevel} sloc sizedtype transform
   let decl_id = identifier.Ast.name in
   let rhs = Option.map ~f:trans_expr initial_value in
   let assign rhs =
-    [{stmt= Assignment ({rhs with texpr= Var decl_id}, rhs); sloc}]
+    {stmt= Assignment ({rhs with texpr= Var decl_id}, rhs); sloc}
   in
   let decl_type = trans_sizedtype sizedtype in
   let decl_var =
@@ -311,10 +318,17 @@ let trans_decl {dread; dconstrain; dadlevel} sloc sizedtype transform
     ; texpr_adlevel= dadlevel
     ; texpr_loc= sloc }
   in
-  let read_stmts =
-    match dread with
-    | Some a -> [mkread decl_id decl_var a dconstrain decl_type transform sloc]
-    | None -> Option.value_map ~default:[] ~f:assign rhs
+  let read_stmt =
+    match (dread, dconstrain) with
+    | Some ReadData, Some Check -> mkdataread decl_id decl_var decl_type sloc
+    | Some ReadParam, Some Constrain | Some ReadParam, Some Unconstrain ->
+        mkparamread decl_id decl_var dconstrain decl_type transform sloc
+    | None, _ -> Option.value_map ~default:{stmt= Skip; sloc} ~f:assign rhs
+    | _ ->
+        raise_s
+          [%message
+            "unexpected dread, constrain combo: "
+              ((dread, dconstrain) : readaction option * constrainaction option)]
   in
   let decl_adtype =
     match rhs with
@@ -323,11 +337,13 @@ let trans_decl {dread; dconstrain; dadlevel} sloc sizedtype transform
   in
   let decl = Decl {decl_adtype; decl_id; decl_type} |> with_sloc in
   let checks =
+    (* XXX checks should be performed after assignment as NRFunApp*)
     match dconstrain with
     | Some Check -> gen_check decl_type decl_id transform sloc dadlevel
     | _ -> []
   in
-  (decl :: read_stmts) @ checks
+  decl :: read_stmt :: checks
+  |> List.filter ~f:(function {stmt= Skip; _} -> false | _ -> true)
 
 let unwrap_block = function
   | [({stmt= Block _; _} as b)] -> b
@@ -498,10 +514,23 @@ let trans_prog filename
            {dread= None; dconstrain= Some Check; dadlevel= AutoDiffable})
         transformedparametersblock
   in
-  let generate_quantities =
+  let modelb =
     map
-      (trans_stmt {dread= None; dconstrain= Some Check; dadlevel= DataOnly})
-      generatedquantitiesblock
+      (trans_stmt {dread= None; dconstrain= None; dadlevel= AutoDiffable})
+      modelblock
+  in
+  let log_prob =
+    prepare_params
+    @
+    match modelb with
+    | [] -> []
+    | hd :: _ -> [{stmt= Block modelb; sloc= hd.sloc}]
+  in
+  let generate_quantities =
+    prepare_params
+    @ map
+        (trans_stmt {dread= None; dconstrain= Some Check; dadlevel= DataOnly})
+        generatedquantitiesblock
   in
   let transform_inits =
     map
@@ -518,11 +547,7 @@ let trans_prog filename
         functionblock
   ; input_vars
   ; prepare_data
-  ; prepare_params
-  ; log_prob=
-      map
-        (trans_stmt {dread= None; dconstrain= None; dadlevel= AutoDiffable})
-        modelblock
+  ; log_prob
   ; generate_quantities
   ; transform_inits
   ; output_vars
@@ -551,9 +576,10 @@ let%expect_test "Prefix-Op-Example" =
   (* Perhaps this is producing too many nested lists. XXX*)
   [%expect
     {|
-      ((Decl (decl_adtype AutoDiffable) (decl_id i) (decl_type SInt))
-       (IfElse (FunApp Less__ ((Var i) (FunApp PMinus__ ((Lit Int 1)))))
-        (NRFunApp Print__ ((Lit Str Badger))) ())) |}]
+      ((Block
+        ((Decl (decl_adtype AutoDiffable) (decl_id i) (decl_type SInt))
+         (IfElse (FunApp Less__ ((Var i) (FunApp PMinus__ ((Lit Int 1)))))
+          (NRFunApp Print__ ((Lit Str Badger))) ())))) |}]
 
 let%expect_test "read data" =
   let m = mir_from_string "data { matrix[10, 20] mat[5]; }" in
@@ -566,12 +592,17 @@ let%expect_test "read data" =
       (upper (FunApp Length__ ((Var mat))))
       (body
        (Block
-        ((Assignment (Indexed (Var mat) ((Single (Var sym1__))))
-          (FunApp ReadData__ ((Lit Str mat) (Lit Int 10) (Lit Int 20))))))))) |}]
+        ((For (loopvar sym2__) (lower (Lit Int 0))
+          (upper (FunApp Length__ ((Indexed (Var mat) ((Single (Var sym1__)))))))
+          (body
+           (Block
+            ((Assignment
+              (Indexed (Var mat) ((Single (Var sym1__)) (Single (Var sym2__))))
+              (FunApp ReadData__ ((Lit Str mat))))))))))))) |}]
 
 let%expect_test "read param" =
   let m = mir_from_string "parameters { matrix<lower=0>[10, 20] mat[5]; }" in
-  print_s [%sexp (m.prepare_params : stmt_loc list)] ;
+  print_s [%sexp (m.log_prob : stmt_loc list)] ;
   [%expect
     {|
     ((Decl (decl_adtype AutoDiffable) (decl_id mat)
@@ -582,8 +613,8 @@ let%expect_test "read param" =
        (Block
         ((Assignment (Indexed (Var mat) ((Single (Var sym1__))))
           (FunApp Constrain__
-           ((FunApp ReadParam__ ((Lit Str mat) (Lit Int 10) (Lit Int 20)))
-            (Lit Str lb) (Lit Str matrix) (Lit Int 0))))))))) |}]
+           ((FunApp ReadParam__ ((Lit Str mat))) (Lit Str lb) (Lit Str real)
+            (Lit Int 0))))))))) |}]
 
 let%expect_test "gen quant" =
   let m =
